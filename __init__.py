@@ -1209,7 +1209,24 @@ class VoxMethods():
                 #Change color att domain, merge verts, Fix normals
                 bpy.ops.mesh.select_all(action='SELECT')
                 bpy.ops.object.mode_set(mode = 'OBJECT')
-                bpy.ops.geometry.attribute_convert(domain='CORNER', data_type='FLOAT_COLOR')
+
+                # Blender 5.2 clears the active attribute when leaving Edit Mode.
+                # Restore the active color attribute before using the context-sensitive
+                # Attribute Convert operator. Meshes without a color attribute do not
+                # need this conversion and should continue through the cleanup flow.
+                ActiveColor = obj.data.color_attributes.active_color
+                if ActiveColor is None and len(obj.data.color_attributes) > 0:
+                    ActiveColor = obj.data.color_attributes[0]
+
+                if ActiveColor is not None:
+                    ActiveAttributeIndex = obj.data.attributes.find(ActiveColor.name)
+                    if ActiveAttributeIndex >= 0:
+                        obj.data.attributes.active_index = ActiveAttributeIndex
+                        if (ActiveColor.domain != 'CORNER' or
+                                ActiveColor.data_type != 'FLOAT_COLOR'):
+                            if bpy.ops.geometry.attribute_convert.poll():
+                                bpy.ops.geometry.attribute_convert(
+                                    domain='CORNER', data_type='FLOAT_COLOR')
                 bpy.ops.object.mode_set(mode = 'EDIT')
 
                 bpy.ops.mesh.remove_doubles()
