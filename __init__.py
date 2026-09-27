@@ -38,6 +38,9 @@ from mathutils import Matrix
 
 import webbrowser
 
+from . import batch
+from .vox_format import read_vox
+
 class FlowData:
     ModelType = None
     MainObj = 0
@@ -129,6 +132,9 @@ class StaticData:
 
 
 class VoxProperties(bpy.types.PropertyGroup):
+    BatchWorkers: IntProperty(name="Parallel workers", default=0, min=0, max=64,
+        description="0: automatic CPU and memory budget. 1: sequential background jobs. Each worker runs an isolated Blender process")
+
     # Clean related ###########################################################################################################################################################################################################################
     BaseColor : bpy.props.FloatVectorProperty(name='',subtype='COLOR_GAMMA',size=4, min=0.0, max=1.0, precision=4, default = StaticData.BaseColorDefault, description="""Base color of the generated image.
 Set this to white before cleaning, if you wish to pixel texture paint on the model!
@@ -225,7 +231,7 @@ called 'Vox Cleaner Backups', not cluttering your Blender outliner""") # type: i
     
 
     #Export related ######################################################################################################################################################################################################################################################
-    ExportLocation : bpy.props.StringProperty(name="",default = "", description="Directory where your objects will be exported", subtype="DIR_PATH") # type: ignore
+    ExportLocation : bpy.props.StringProperty(name="",default = "", description="Directory where your objects will be exported", subtype="DIR_PATH", options={"PATH_SUPPORTS_BLEND_RELATIVE"} if bpy.app.version >= (4, 5, 0) else set()) # type: ignore
 
     TriangulatedExport: bpy.props.BoolProperty(name="Export Triangulated model", default = StaticData.TriangulateDefault, description="Enabling triangulates the model before exporting. (Enabling is highly recommended)") # type: ignore
     
@@ -262,7 +268,7 @@ class Vec3:
         self.x, self.y, self.z = X, Y, Z
     
     def _index(self):
-        return self.x + self.y*256 + self.z*256*256
+        return (self.x, self.y, self.z)
 
 class VoxelObject:
     def __init__(self, Voxels, Size):
@@ -413,7 +419,7 @@ class VoxelObject:
             # Add color attributes for all selected maps, and also make variables for em
             if mytool.ImportColor:
                 bpy.ops.geometry.color_attribute_add(name = "Color", domain='CORNER', data_type='BYTE_COLOR')
-                ColorLayer = mesh.vertex_colors["Color"]
+                ColorLayer = mesh.color_attributes["Color"]
                 i = 0
                 for poly in mesh.polygons:
                     for idx in poly.loop_indices:
@@ -422,7 +428,7 @@ class VoxelObject:
 
             if mytool.ImportRoughness:
                 bpy.ops.geometry.color_attribute_add(name = "Roughness", domain='CORNER', data_type='BYTE_COLOR')
-                RoughnessLayer = mesh.vertex_colors["Roughness"]
+                RoughnessLayer = mesh.color_attributes["Roughness"]
                 i = 0
                 for poly in mesh.polygons:
                     for idx in poly.loop_indices:
@@ -431,7 +437,7 @@ class VoxelObject:
 
             if mytool.ImportMetallic:
                 bpy.ops.geometry.color_attribute_add(name = "Metallic", domain='CORNER', data_type='BYTE_COLOR')
-                MetallicLayer = mesh.vertex_colors["Metallic"]
+                MetallicLayer = mesh.color_attributes["Metallic"]
                 i = 0
                 for poly in mesh.polygons:
                     for idx in poly.loop_indices:
@@ -440,7 +446,7 @@ class VoxelObject:
 
             if mytool.ImportEmission:
                 bpy.ops.geometry.color_attribute_add(name = "Emission", domain='CORNER', data_type='BYTE_COLOR')
-                EmissionLayer = mesh.vertex_colors["Emission"]
+                EmissionLayer = mesh.color_attributes["Emission"]
                 i = 0
                 for poly in mesh.polygons:
                     for idx in poly.loop_indices:
@@ -449,7 +455,7 @@ class VoxelObject:
 
             if mytool.ImportTransmission:
                 bpy.ops.geometry.color_attribute_add(name = "Transmission", domain='CORNER', data_type='BYTE_COLOR')
-                TransmissionLayer = mesh.vertex_colors["Transmission"]
+                TransmissionLayer = mesh.color_attributes["Transmission"]
                 i = 0
                 for poly in mesh.polygons:
                     for idx in poly.loop_indices:
@@ -458,7 +464,7 @@ class VoxelObject:
             '''
             if mytool.ImportSubSurface:
                 bpy.ops.geometry.color_attribute_add(name = "SubSurface", domain='CORNER', data_type='BYTE_COLOR')
-                SSSLayer = mesh.vertex_colors["SubSurface"]
+                SSSLayer = mesh.color_attributes["SubSurface"]
                 i = 0
                 for poly in mesh.polygons:
                     for idx in poly.loop_indices:
@@ -581,505 +587,52 @@ class ImportVox(Operator, ImportHelper):
             paths.append(self.filepath)
             print("SELF.fp",paths)
         
-        def read_chunk(buffer):
-            *name, h_size, h_children = struct.unpack('<4cii', buffer.read(12))
-            name = b"".join(name)
-            content = bytearray(buffer.read(h_size))
-            return name, content
-
-        def read_content(content, size):
-            out = content[:size]
-            del content[:size]
-            
-            return out
-
-        def read_dict(content):
-            dict = {}
-            
-            dict_size, = struct.unpack('<i', read_content(content, 4))
-            for _ in range(dict_size):
-                key_bytes, = struct.unpack('<i', read_content(content, 4))
-                key = struct.unpack('<'+str(key_bytes)+'c', read_content(content, key_bytes))
-                key = b"".join(key)
-                
-                value_bytes, = struct.unpack('<i', read_content(content, 4))
-                value = struct.unpack('<'+str(value_bytes)+'c', read_content(content, value_bytes))
-                value = b"".join(value)
-                
-                dict[key] = value
-            
-            return dict
-
-        def import_vox(path):
-            
-            mytool = bpy.context.scene.vox_tool
-
-            def IntTo3x3Matrix(rotation):
-
-                RotMatrix = Matrix( ((0, 0, 0),
-                                    (0, 0, 0),
-                                    (0, 0, 0)) )
-
-                # Get indices of first, second and third=
-                first_index = rotation & 0b0011
-                second_index = (rotation & 0b1100) >> 2
-                array = [-1, -1, -1]
-                index = 0
-
-                array[first_index] = 0
-                array[second_index] = 0
-
-                for i in range(len(array)):
-                    if array[i] == -1:
-                        index = i
-                        break
-
-                third_index = index
-
-                # Get negatives
-                negative_first = ((rotation & 0b0010000) >> 4) == 1
-                negative_second = ((rotation & 0b0100000) >> 5) == 1
-                negative_third = ((rotation & 0b1000000) >> 6) == 1
-
-                print("rotation", rotation)
-                print("NEGATIVES", negative_first, negative_second, negative_third)
-
-                '''
-                for row in matrix.elements:
-                    print(' '.join(map(str, row)))
-                '''
-                RotMatrix[0][first_index] = -1 if negative_first else 1
-                RotMatrix[1][second_index] = -1 if negative_second else 1
-                RotMatrix[2][third_index] = -1 if negative_third else 1
-                
-                print("Matrix", RotMatrix)
-
-                return RotMatrix
-            
-            with open(path, 'rb') as file:
-                file_name = os.path.basename(file.name).replace('.vox', '')
-                file_size = os.path.getsize(path)
-
-                palette = []
-                materials = [[0.0, 0.0, 0.0, 0.0] for _ in range(255)] # [roughness, metallic, emission, glass] * 255
-                
-                # Makes sure it's supported vox file
-                VoxFileVersionData = struct.unpack('<4ci', file.read(8))
-
-                try: assert (VoxFileVersionData == (b'V', b'O', b'X', b' ', 200))
-                except AssertionError as AE:
-                    print(AE, "Vox File Version", VoxFileVersionData)
-                    stmt = "Older Magicavoxel Files like '"+file_name+".vox' are not supported. Please update your Magicavoxel & try again with newer files."
-                    self.report({'WARNING'}, stmt)
-                    
-                    return {'CANCELLED'}
-
-                
-                # MAIN chunk
-                assert (struct.unpack('<4c', file.read(4)) == (b'M', b'A', b'I', b'N'))
-                N, M = struct.unpack('<ii', file.read(8))
-                assert (N == 0)
-                
-
-                # Nested dictionaries with all the properties.
-
-                LayerIDs = {}      # [lID][Name] = "name", Visible = 1/0]
-                TransformIDs = {}  # [tID][ChildID = sID/gID, Name = "name", Visible = 0/1, "Transform" = TransformMatrix4x4]
-                GroupIDs = {}      # [gID] = tIDs
-                ShapeIDs = {}      # [sID] = mIDs
-                ModelIDs = {}      # [mID] = Model ie VoxelObject
-                mID = 0
-                
-
-                ### Parse File ###
-                while file.tell() < file_size:
-                    name, content = read_chunk(file)
-
-                    
-                    if name == b'SIZE': # Size of object.
-                        x, y, z = struct.unpack('<3i', read_content(content, 12))
-                        size = Vec3(x, y, z)
-                    
-                    elif name == b'XYZI': # Location and color id of voxel.
-                        voxels = []
-                        
-                        num_voxels, = struct.unpack('<i', read_content(content, 4))
-                        for voxel in range(num_voxels):
-                            voxel_data = struct.unpack('<4B', read_content(content, 4))
-                            voxels.append(voxel_data)
-                        
-                        model = VoxelObject(voxels, size)
-                        ModelIDs[mID] = model
-                        #print("ModelID",mod_id)
-                        #ModelData[mod_id] = {}
-                        mID += 1
-                        #print("read XYZI #########################################")
-                    
-                    elif name == b'LAYR':
-                        lID, = struct.unpack('<i', read_content(content, 4))
-                        if lID > 255: continue # Why are there material values for id 256?
-                        LayerIDs[lID] = {}
-                        
-                        LayerInfo = read_dict(content)
-
-                        if b'_hidden' in LayerInfo:
-                            LayerIDs[lID]["Visible"] = 0
-                        else:
-                            LayerIDs[lID]["Visible"] = 1
-
-                        if b'_name' in LayerInfo:
-                            LayerIDs[lID]["Name"] = LayerInfo[b'_name'].decode('utf-8')
-                        else:
-                            LayerIDs[lID]["Name"] = "NoName"+str(lID)
-                            
-                    elif name == b'nTRN': # Position and rotation of object.
-                        tID, = struct.unpack('<i', read_content(content, 4))
-                        TransformIDs[tID] = {}
-                        TransformNodeAttributes = read_dict(content)
-
-                        # initialise transform matrix
-                        TransformIDs[tID]["Transform"] = Matrix( ((1, 0, 0, 0),(0, 1, 0, 0),(0, 0, 1, 0),(0, 0, 0, 1)) )
-
-                        if b'_name' in TransformNodeAttributes:
-                            TransformIDs[tID]["Name"] = TransformNodeAttributes[b'_name'].decode('utf-8')
-                        else: TransformIDs[tID]["Name"] = "XYZ"
-
-                        if b'_hidden' in TransformNodeAttributes:
-                            TransformIDs[tID]["Visible"] = 0
-                        else: TransformIDs[tID]["Visible"] = 1
-                        
-                        ChildID, ResID, = struct.unpack('<2i', read_content(content, 8))
-                        TransformIDs[tID]["ChildID"] = ChildID
-                        #TransformChildRelations[id] = [child_id]
-                        
-                        LayerID, = struct.unpack('<i', read_content(content, 4))
-                        TransformIDs[tID]["lID"] = LayerID
-
-                        FrameCount, = struct.unpack('<i', read_content(content, 4))
-
-                        #Apply Translation & Rotation
-                        frames = read_dict(content)
-
-                        # position
-                        if b'_t' in frames:
-                            value = frames[b'_t'].decode('utf-8').split()
-                            #Pos = np.array([int(value[0]), int(value[1]), int(value[2])])
-
-                            TransformIDs[tID]["Transform"][0][3] = int(value[0])
-                            TransformIDs[tID]["Transform"][1][3] = int(value[1])
-                            TransformIDs[tID]["Transform"][2][3] = int(value[2])
-
-
-                        # Rotation
-                        if b'_r' in frames:
-                            value = frames[b'_r']
-                            RotMatrix3x3 = IntTo3x3Matrix(int(value))
-
-                            for i in range(3):
-                                TransformIDs[tID]["Transform"][i][0] = RotMatrix3x3[i][0]
-                                TransformIDs[tID]["Transform"][i][1] = RotMatrix3x3[i][1]
-                                TransformIDs[tID]["Transform"][i][2] = RotMatrix3x3[i][2]
-                            
-                            #Rot = Vec3(int(x), int(y), int(z))
-                        #TransformIDs[tID]["Rotation"] = RotMatrix4x4
-                    
-                    elif name == b'nGRP':
-                        gID, = struct.unpack('<i', read_content(content, 4))
-                        GroupIDs[gID] = {}
-                        GroupAttributes = read_dict(content)
-
-                        NoOf_tIDs, = struct.unpack('<i', read_content(content, 4))
-                        Child_tIDs = []
-                        
-                        for k in range(NoOf_tIDs):
-                            Child_tIDs.append(struct.unpack('<i', read_content(content, 4))[0])
-                        
-                        GroupIDs[gID] = Child_tIDs
-                    
-                    elif name == b'nSHP':
-                        sID, = struct.unpack('<i', read_content(content, 4))
-                        ShapeIDs[sID] = {}
-                        
-                        ShpAttributes = read_dict(content)
-                        
-                        NoOf_mIDs, = struct.unpack('<i', read_content(content, 4))
-                        Connected_mIDs = []
-                        
-                        for k in range(NoOf_mIDs):
-                            Connected_mIDs.append(struct.unpack('<i', read_content(content, 4))[0])
-                        
-                        ShapeIDs[sID] = Connected_mIDs
-
-                    elif name == b'RGBA':
-                        for _ in range(255):
-                            rgba = struct.unpack('<4B', read_content(content, 4))
-                            palette.append([float(col)/255 for col in rgba])
-                        del content[:4] # Contains a 256th color for some reason.
-                    
-                    elif name == b'MATL':
-                        id, = struct.unpack('<i', read_content(content, 4))
-                        if id > 255: continue # Why are there material values for id 256?
-                        
-                        mat_dict = read_dict(content)
-                        
-                        type = None
-                        TypeDecided = False
-                        SubSurfaceType = False
-                        #OgId = -1000
-
-                        for key in mat_dict:
-                            value = mat_dict[key]
-                            
-                            #Fix on a type of material
-                            if TypeDecided== False:
-                                if key == b'_type':
-                                    # if type of material is from metal, glass, emit or blend, set type to it
-                                    if value == b'_metal' or value == b'_emit' or value == b'_glass' or value == b'_blend': 
-                                        type = value
-                                        TypeDecided = True
-                                    else:
-                                        type = b'_diffuse'
-                                        TypeDecided = True
-                                    
-                                else:
-                                    materials[id-1][0] = float(StaticData.RoughnessDefault) #default roughness value
-                                    TypeDecided = True
-
-                            # then assign different properties based on the type of the material, if type is decided
-                            if TypeDecided == True:
-                                    
-                                # Metal type material
-                                if type == b'_metal':
-
-                                    if key == b'_rough':
-                                        materials[id-1][0] = float(value) # Roughness
-                                    if key == b'_metal':
-                                        materials[id-1][1] = float(value) # Metalic
-                                        
-                                    
-                                # Glass type material
-                                elif type == b'_glass':
-                                    if key == b'_rough':
-                                        materials[id-1][0] = float(value) # Roughness
-
-                                    if key == b'_media_type':
-                                        if value == b'_sss': SubSurfaceType = True
-                                        else: SubSurfaceType = False
-
-                                    if key == b'_alpha':
-                                        k = 1 if mytool.MaxMaps == True else float(value)
-                                        if SubSurfaceType == False:
-                                            materials[id-1][3] = k # Glass
-                                        
-                                    
-                                    '''
-                                    Glass Keys b'_type' b'_glass'
-                                    Glass Keys b'_media_type' b'_sss'
-                                    Glass Keys b'_media' b'3'
-                                    Glass Keys b'_alpha' b'0.912209'
-                                    Glass Keys b'_trans' b'0.912209'
-                                    Glass Keys b'_rough' b'0.800245'
-                                    Glass Keys b'_ior' b'0.3'
-                                    Glass Keys b'_ri' b'1.3'
-                                    Glass Keys b'_g' b'0.47'
-                                    Glass Keys b'_d' b'0.017936'
-                                    '''
-
-
-                                # Emission type material
-                                elif type == b'_emit':
-                                    
-                                    if key == b'_rough':
-                                        materials[id-1][0] = float(value) # Roughness                                
-                                    
-                                    if key == b'_emit':
-                                        k = 1 if mytool.MaxMaps == True else float(value)
-                                        materials[id-1][2] = k # Emission value only
-                                        
-                                    if key == b'_flux':
-                                        P = float(value)
-                                        
-                                    
-                                # Blend type material
-                                elif type == b'_blend':
-                                    if key == b'_rough':
-                                        materials[id-1][0] = float(value) # Roughness                                
-                                    if key == b'_metal':
-                                        materials[id-1][1] = float(value) # Metalic
-                                    if key == b'_media_type':
-                                        if value == b'_sss':
-                                            SubSurfaceType = True
-                                        else:
-                                            SubSurfaceType = False
-
-                                    if key == b'_alpha':
-                                        k = 1 if mytool.MaxMaps == True else float(value)
-                                        if SubSurfaceType == False:
-                                            materials[id-1][3] = k # Glass
-
-            # Post process the acquired data
-            for tID in TransformIDs:
-                if tID == 0:
-                    TransformIDs[tID]["Name"] = "ROOT"
-                if TransformIDs[tID]["lID"] != -1:
-                    TransformIDs[tID]["OverallVisibility"] = LayerIDs[TransformIDs[tID]["lID"]]["Visible"] and TransformIDs[tID]["Visible"]
-                else:
-                    TransformIDs[tID]["OverallVisibility"] = 1
-                if TransformIDs[tID]["ChildID"] in GroupIDs:
-                    TransformIDs[tID]["Type"] = "Group"
-                if TransformIDs[tID]["ChildID"] in ShapeIDs:
-                    TransformIDs[tID]["Type"] = "Shape"
-
-                
-                        
-            # get a material made from the parameters provided
-            if any([mytool.ImportColor, mytool.ImportRoughness, mytool.ImportMetallic, mytool.ImportEmission, mytool.ImportTransmission]) == False: ImportVox.VMaterial = "NoMatNeeded"
-            else: ImportVox.VMaterial = VoxMethods.CreateCRMETS(context, mytool.ImportColor, mytool.ImportRoughness, mytool.ImportMetallic, mytool.ImportEmission, mytool.ImportTransmission)
-                
-            # Create Collections
-            collections = (None)
-            if mytool.Organize:
-                FileCollection = bpy.data.collections.new(file_name)
-                bpy.context.scene.collection.children.link(FileCollection)
-                
-                collections = FileCollection
-            
-            # TransformIDs[tID] = {"Name":name, "Visible":0/1, "lID":lID, "Transform":TransformMatrix4x, "ChildID":sID/gID}
-            # Defining the traverse function
-            def Traverse(tID, visible, TransformMatrix):
-                if TransformIDs[tID]["Type"] == "Group":
-                    if visible == True or mytool.ImportHidden == True: 
-                        for child in GroupIDs[TransformIDs[tID]["ChildID"]]:
-                            Traverse(child, visible and TransformIDs[child]["OverallVisibility"], TransformMatrix @ TransformIDs[child]["Transform"])
-
-                else:
-                    #generate model
-                    if visible == True or mytool.ImportHidden == True:
-                        #print(tID, TransformIDs[tID]["Name"], visible, pos)
-                        CurrentName = None
-                        # check if the name in the id is not XYZ
-                        if TransformIDs[tID]["Name"] != "XYZ":
-                            CurrentName = TransformIDs[tID]["Name"]
-                        else:
-                            FlowData.ImportNameIndex += 1
-                            CurrentName = file_name + "_" + str(FlowData.ImportNameIndex)
-                        
-                        # stuff to be intersected with the group attributes - Hidden, Pos, Rot
-                        ModelIDs[ShapeIDs[TransformIDs[tID]["ChildID"]][0]].generate(CurrentName, palette, materials, collections, TransformMatrix)
-            
-            # finally generating the models using traverse
-            Traverse(0, TransformIDs[0]["OverallVisibility"], TransformIDs[0]["Transform"])
-
-            # Print out the Import Summary in the console!
-            print("\n")
-
-            Visible = "●"
-            Hidden = "○"
-
-            print('''● IMPORT DATA''')
-            print('''———————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————''')
-            print("  File     (","Name: "+str(file_name)+".vox )"+"                        Legend   (●: Visible , ○: Hidden)")
-            print("\n")
-            print("  Layers —————————————————————————————————————————————")
-
-            Rows = 10
-
-            Columns = math.ceil(len(LayerIDs)/Rows)
-
-            for key in range(0,Rows):
-                for i in range(0,Columns):
-                    if i != Columns-1:
-                        try: print("   "+str(Hidden if LayerIDs[i*Rows+key]["Visible"] == 0 else Visible) +" "+ str(i*Rows+key).zfill(2)+". "+str(LayerIDs[i*Rows+key]["Name"]).ljust(15), end = "    ")
-                        except: continue
-                    else:
-                        if i*Rows+key >= len(LayerIDs):
-                            print("")
-                        else : 
-                            try: print("   "+str(Hidden if LayerIDs[i*Rows+key]["Visible"] == 0 else Visible) +" "+ str(i*Rows+key).zfill(2)+". "+str(LayerIDs[i*Rows+key]["Name"]).ljust(15))
-                            except: continue
-
-            print("\n")
-            
-            print("  Models ———————————————————————————————————————————————————————————————————————————————————————")
-            print("       ●  tID Name                        Layer          Pos             Rot          Shape/Group Data")
-            print("   ---------------------------------------------------------------------------------------------")
-
-            ShiftValues = {}
-
-            # Model lists
-            for tid in TransformIDs:
-
-                # Prefix. R or G for Root & groups
-                prefix = str("      ").rjust(7) if tid != 0 else str("R ").rjust(7)
-                #add shift values
-                if TransformIDs[tid]["Type"] == "Group" and tid != 0:
-                    prefix = str("G ").rjust(7)
-                    for groupchild in GroupIDs[TransformIDs[tid]["ChildID"]]:
-                        if tid in ShiftValues.keys(): 
-                            ShiftValues[groupchild] = ShiftValues[tid] + 1
-                        else:
-                            ShiftValues[groupchild] = 1
-
-                Visibility = str(Hidden if TransformIDs[tid]["OverallVisibility"] == 0 else Visible).ljust(2)
-
-                tID = str(tid).ljust(3)
-
-                name = str(TransformIDs[tid]["Name"]).ljust(20)
-                
-                #Shift & name section
-                if tid in ShiftValues.keys():NameSection = str(str(">"*ShiftValues[tid])+" "+Visibility+tID+name).ljust(35)
-                else:NameSection = str(Visibility+tID+name).ljust(35)
-
-                #layer
-                if tid == 0: layer = str("-").ljust(15)
-                else: layer = str(LayerIDs[TransformIDs[tid]["lID"]]["Name"]).ljust(15)
-
-                pos = str(str(TransformIDs[tid]["Transform"][0][3])+","+str(TransformIDs[tid]["Transform"][1][3])+","+str(TransformIDs[tid]["Transform"][2][3])).ljust(16)
-
-                p = int(math.degrees(math.atan2(TransformIDs[tid]["Transform"][2][1], TransformIDs[tid]["Transform"][2][2])))
-                q = int(math.degrees(math.asin(-TransformIDs[tid]["Transform"][2][0])))
-                r = int(math.degrees(math.atan2(TransformIDs[tid]["Transform"][1][0], TransformIDs[tid]["Transform"][0][0])))
-                rot = str(str(p)+","+str(q)+","+str(r)).ljust(13)
-
-                if TransformIDs[tid]["Type"] == "Group":ChildData = str(str(TransformIDs[tid]["ChildID"])+" - "+str(GroupIDs[TransformIDs[tid]["ChildID"]])).ljust(20)
-                else:ChildData = str(TransformIDs[tid]["ChildID"]).ljust(20)
-                #ChildID = str(TransformIDs[tid]["ChildID"]).ljust(8)+"  "
-
-
-
-                stmt = prefix+NameSection+layer+pos+rot+ChildData
-                print(stmt)
-
-            print("\n")   
-            print("\n  Process Ended GGs ———————————————————————————————————————————————————————")
-            print("\n\n")
-
-            # Reset Parameters --------------------------------------------------------------------------
-            MaterialName = None
-            VMaterial = None
-
-
-            palette = []
-            materials = [[0.0, 0.0, 0.0, 0.0] for _ in range(255)] # [roughness, metallic, glass, emission] * 255
-            
-            LayerIDs = {}      # [lID][Name] = "name", Visible = 1/0]
-            TransformIDs = {}  # [tID][ChildID = sID/gID, Name = "name", Visible = 0/1, Transform = TransformMatrix4x4]
-            GroupIDs = {}      # [gID] = tIDs
-            ShapeIDs = {}      # [sID] = mIDs
-            ModelIDs = {}      # [mID] = Model ie VoxelObject
-            mID = 0
-
-            ShiftValues = {}
-
-            stmt = "Magicavoxel File imported" if len(paths) == 1 else str(len(paths))+" Magicavoxel Files imported"
-            self.report({'INFO'}, stmt)
-
+        if context.mode != 'OBJECT':
+            self.report({'WARNING'}, 'Enter Object Mode before importing')
+            return {'CANCELLED'}
+        if batch.ACTIVE or FlowData.ProcessRunning:
+            self.report({'WARNING'}, 'Finish the current clean operation first')
+            return {'CANCELLED'}
+        mytool = context.scene.vox_tool
+        imported, failures = [], []
+        cursor = context.scene.cursor.location.copy()
         for path in paths:
-            import_vox(path)
-        
-        
-        
-        return {"FINISHED"}
+            before = set(bpy.data.objects)
+            try:
+                data = read_vox(path, StaticData.RoughnessDefault, mytool.MaxMaps)
+                name = os.path.splitext(os.path.basename(path))[0]
+                channels = (mytool.ImportColor, mytool.ImportRoughness,
+                            mytool.ImportMetallic, mytool.ImportEmission, mytool.ImportTransmission)
+                ImportVox.VMaterial = VoxMethods.CreateCRMETS(context, *channels) if any(channels) else "NoMatNeeded"
+                collection = None
+                if mytool.Organize:
+                    collection = bpy.data.collections.new(name)
+                    context.scene.collection.children.link(collection)
+                for index, (model_id, model_name, visible, transform) in enumerate(data['instances']):
+                    if not visible and not mytool.ImportHidden:
+                        continue
+                    size, voxels = data['models'][model_id]
+                    model = VoxelObject(voxels, Vec3(*size))
+                    model.generate(model_name or f'{name}_{index + 1}', data['palette'],
+                                   data['materials'], collection, Matrix(transform))
+                imported.extend(obj for obj in bpy.data.objects if obj not in before)
+            except (OSError, ValueError, RuntimeError) as error:
+                failures.append(f'{os.path.basename(path)}: {error}')
+                for obj in set(bpy.data.objects) - before:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+            finally:
+                context.scene.cursor.location = cursor
+                ImportVox.VMaterial = None
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in imported:
+            obj.select_set(True)
+        if imported:
+            context.view_layer.objects.active = imported[0]
+        message = f'Imported {len(imported)} models from {len(paths) - len(failures)}/{len(paths)} VOX files'
+        if failures:
+            message += '; ' + '; '.join(failures)
+        self.report({'WARNING'} if failures else {'INFO'}, message)
+        return {'FINISHED'} if imported else {'CANCELLED'}
 
     def draw(self, context):
         mytool = bpy.context.scene.vox_tool
@@ -1140,6 +693,10 @@ class VoxMethods():
         #Outputs in the form of CleaningStatus, StepStatus, ExportStatus
         mytool = context.scene.vox_tool
 
+        if batch.ACTIVE:
+            message = "Batch running; Esc to cancel"
+            return message, message, message
+
         # Check for object mode
         if bpy.context.mode == 'OBJECT': pass
         else: return "Enter object mode to clean","Enter object mode to clean","Enter object mode for exports"
@@ -1175,7 +732,7 @@ class VoxMethods():
         # Clean or Bake Check for Lazy Clean
         if len(bpy.context.selected_objects) > 1: Lazy = "Please select a single object"
 
-        SharedStatus = len(bpy.context.selected_objects) if mytool.CommonUV or len(bpy.context.selected_objects) == 1 else "Select a single object or Enable Shared UVs"
+        SharedStatus = len(bpy.context.selected_objects)
         Lazy = SharedStatus if mytool.CleanGeo or mytool.BakeTex else "Select atleast one options above to clean"
         
         # Common UV Check for 2Step
@@ -1184,7 +741,7 @@ class VoxMethods():
             if mytool.CommonUV:TwoStep = len(bpy.context.selected_objects)
             else:TwoStep = "Select a single object or Enable Shared UVs"
 
-        return Lazy, TwoStep, len(bpy.context.selected_objects) if len(bpy.context.selected_objects) == 1 else "Please select a single object"
+        return Lazy, TwoStep, len(bpy.context.selected_objects)
         
         
     def MrModelTypeChecker(ObjectList):
@@ -1250,13 +807,13 @@ class VoxMethods():
                             break 
                 except ValueError:
                     pass
-                bm.free()
+                bmesh.update_edit_mesh(bpy.context.active_object.data)
 
                 TypeList.add(Type)            
                 bpy.ops.object.mode_set(mode = 'OBJECT')
 
                 # Fix Shading
-                if Type == "Voxel" or "MC":
+                if Type in {"Voxel", "MC"}:
                     bpy.ops.object.shade_flat()
 
 
@@ -1357,7 +914,7 @@ class VoxMethods():
                 ColAtt_Color.name = "Color"
                 ColAtt_Color.location = (-324,466)
 
-                links.new(ColAtt_Color.outputs["Color"], bsdf.inputs[0])
+                links.new(ColAtt_Color.outputs["Color"], bsdf.inputs["Base Color"])
 
             if M:
                 ColAtt_Metallic = nodes.new("ShaderNodeVertexColor")
@@ -1365,7 +922,7 @@ class VoxMethods():
                 ColAtt_Metallic.name = "Metallic"
                 ColAtt_Metallic.location = (-324,352)
 
-                links.new(ColAtt_Metallic.outputs["Color"], bsdf.inputs[1])
+                links.new(ColAtt_Metallic.outputs["Color"], bsdf.inputs["Metallic"])
 
             if R:
                 ColAtt_Roughness = nodes.new("ShaderNodeVertexColor")
@@ -1373,7 +930,7 @@ class VoxMethods():
                 ColAtt_Roughness.name = "Roughness"
                 ColAtt_Roughness.location = (-324,238)
 
-                links.new(ColAtt_Roughness.outputs["Color"], bsdf.inputs[2])
+                links.new(ColAtt_Roughness.outputs["Color"], bsdf.inputs["Roughness"])
 
             if T:
                 ColAtt_Transmission = nodes.new("ShaderNodeVertexColor")
@@ -1381,7 +938,7 @@ class VoxMethods():
                 ColAtt_Transmission.name = "Transmission"
                 ColAtt_Transmission.location = (-324,10)
 
-                links.new(ColAtt_Transmission.outputs["Color"], bsdf.inputs[17])
+                links.new(ColAtt_Transmission.outputs["Color"], bsdf.inputs["Transmission Weight"])
 
             if E:
                 ColAtt_Emission = nodes.new("ShaderNodeVertexColor")
@@ -1389,9 +946,9 @@ class VoxMethods():
                 ColAtt_Emission.name = "Emission"
                 ColAtt_Emission.location = (-324,-104)
 
-                links.new(ColAtt_Emission.outputs["Color"], bsdf.inputs[27])
+                links.new(ColAtt_Emission.outputs["Color"], bsdf.inputs["Emission Strength"])
                 if C:
-                    links.new(ColAtt_Color.outputs["Color"], bsdf.inputs[26])
+                    links.new(ColAtt_Color.outputs["Color"], bsdf.inputs["Emission Color"])
         else: 
             # if the material is already there
             VMaterial = bpy.data.materials.get(MaterialName)
@@ -1600,7 +1157,7 @@ class VoxMethods():
         # analyse the current material on MainObj. make a bakelist based on the colAtt nodes present
         for mat in FlowData.MainObj.data.materials:
             if mat is None: continue
-            else:  mat.use_nodes == True
+            else:  mat.use_nodes = True
 
             for node in mat.node_tree.nodes:
                 if node.type == 'VERTEX_COLOR' and node.mute == False:
@@ -1655,7 +1212,7 @@ class VoxMethods():
                 ImageTextureNode.interpolation = 'Closest' if FlowData.ModelType == "Voxel" else 'Linear'
                 ImageTextureNode.location = (-434,695)
 
-                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs[0])
+                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs["Base Color"])
 
                 Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs['Emission Color'])
 
@@ -1665,7 +1222,7 @@ class VoxMethods():
                 ImageTextureNode.interpolation = 'Closest'
                 ImageTextureNode.location = (-434,143)
 
-                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs[2])
+                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs["Roughness"])
 
             if Map == "Metallic":
                 ImageTextureNode = nodes.new(type = 'ShaderNodeTexImage')
@@ -1673,7 +1230,7 @@ class VoxMethods():
                 ImageTextureNode.interpolation = 'Closest'
                 ImageTextureNode.location = (-434,419)
 
-                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs[1])
+                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs["Metallic"])
 
             if Map == "Emission":
                 ImageTextureNode = nodes.new(type = 'ShaderNodeTexImage')
@@ -1688,7 +1245,7 @@ class VoxMethods():
                 MathNode.location = (144,-496)
 
                 Links.new(ImageTextureNode.outputs[0], MathNode.inputs[0])
-                Links.new(MathNode.outputs[0], PrincipledBSDF.inputs[27])
+                Links.new(MathNode.outputs[0], PrincipledBSDF.inputs["Emission Strength"])
 
                 MathNode.inputs[1].default_value = mytool.EmitStrength
             
@@ -1698,7 +1255,7 @@ class VoxMethods():
                 ImageTextureNode.interpolation = 'Closest'
                 ImageTextureNode.location = (-115,-220)
 
-                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs[17])
+                Links.new(ImageTextureNode.outputs[0], PrincipledBSDF.inputs["Transmission Weight"])
             
 
 
@@ -1770,7 +1327,7 @@ class VoxMethods():
 
             #print("Fractal Dist",FractionDistance)
             FlowData.ApproxLen = 1/FractionDistance
-            bm.free()
+            bmesh.update_edit_mesh(bpy.context.active_object.data)
 
             bpy.ops.object.mode_set(mode = 'OBJECT')
 
@@ -1858,7 +1415,7 @@ class VoxMethods():
 
     def GeometryCleanUp(context):
 
-        if FlowData.ModelType == "Voxel" or "MC":
+        if FlowData.ModelType in {"Voxel", "MC"}:
             # Voxel/MC Model
             #Add and apply modifiers
             bpy.ops.object.mode_set(mode = 'OBJECT')
@@ -1894,7 +1451,7 @@ class VoxMethods():
             else:
                 DecimationRatio = 3000/FlowData.VertexCountInitialX
 
-            bpy.context.object.modifiers["MrCleaner"].ratio = DecimationRatio
+            bpy.context.object.modifiers["MrCleaner"].ratio = 1.0 - context.scene.vox_tool.NVDecimation / 100.0
             bpy.ops.object.modifier_apply(modifier="MrCleaner", report=True)
 
             # select main
@@ -1982,38 +1539,47 @@ class VoxMethods():
                 
                 loop_uv.uv *= FlowData.ResizeFactor
         
-        bm.free()
+        bmesh.update_edit_mesh(bpy.context.active_object.data)
         bpy.ops.object.mode_set(mode = 'OBJECT')
 
 
         
-        # Snap UV islands to Pixels
-        bpy.ops.object.mode_set(mode = 'EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.object.mode_set(mode = 'OBJECT')
-        
-        CurrentAreaType  = bpy.context.area.type
-        CurrentUIType = bpy.context.area.ui_type
+        # Snap UV boundaries to image pixels in foreground and background Blender.
+        if FlowData.GeneratedTex_Active is not None:
+            width, height = FlowData.GeneratedTex_Active.size
+            for loop in FlowData.MainObj.data.uv_layers.active.data:
+                loop.uv = (math.floor(loop.uv.x * width + 0.5) / width,
+                           math.floor(loop.uv.y * height + 0.5) / height)
 
-        bpy.context.area.type = 'IMAGE_EDITOR'
-        bpy.context.area.ui_type = 'UV'
-
-        if(FlowData.GeneratedTex_Active != None):
-            bpy.context.area.spaces.active.image = FlowData.GeneratedTex_Active
-
-            bpy.ops.object.mode_set(mode = 'EDIT')
-            bpy.ops.uv.select_all(action='SELECT')
-            bpy.ops.uv.snap_selected(target='PIXELS')
-        else:
-            #print("NO Texture")
-            pass
-
-        bpy.context.area.type = CurrentAreaType
-        bpy.context.area.ui_type = CurrentUIType
-
-        bpy.ops.object.mode_set(mode = 'OBJECT')
-        
     def TextureBake(context):
+        scene = context.scene
+        engine = scene.render.engine
+        device, bake_type = scene.cycles.device, scene.cycles.bake_type
+        fields = ('use_pass_color', 'use_pass_direct', 'use_pass_indirect', 'use_clear',
+                  'use_selected_to_active', 'cage_extrusion', 'max_ray_distance', 'margin', 'margin_type')
+        saved = {key: getattr(scene.render.bake, key) for key in fields}
+        source = FlowData.DupeObj
+        original_materials = list(source.data.materials)
+        copies = [mat.copy() if mat else None for mat in original_materials]
+        source.data.materials.clear()
+        for mat in copies:
+            source.data.materials.append(mat)
+        try:
+            VoxMethods._TextureBake(context)
+        finally:
+            source.data.materials.clear()
+            for mat in original_materials:
+                source.data.materials.append(mat)
+            for mat in copies:
+                if mat is not None and mat.users == 0:
+                    bpy.data.materials.remove(mat)
+            for key, value in saved.items():
+                setattr(scene.render.bake, key, value)
+            scene.cycles.device, scene.cycles.bake_type = device, bake_type
+            scene.render.engine = engine
+            source.hide_set(True)
+
+    def _TextureBake(context):
 
         #No material on Dupe - bake aise hi
         #Some random material on Dupe - bake diffuse aise hi
@@ -2027,7 +1593,11 @@ class VoxMethods():
 
         # set bake settings
         bpy.context.scene.render.engine = 'CYCLES'
-        bpy.context.scene.cycles.device = 'GPU'
+        # Honor the scene device; batch workers explicitly use CPU.
+        if scene.cycles.device == 'GPU':
+            preferences = context.preferences.addons.get('cycles')
+            if preferences is None or not preferences.preferences.has_active_device():
+                scene.cycles.device = 'CPU'
 
         bpy.context.scene.cycles.bake_type = 'EMIT'
         bpy.context.scene.render.bake.use_pass_color = True
@@ -2201,7 +1771,7 @@ class VoxMethods():
                 else:stmt = ", CommonUV: False"
                 print("  Options  ( CleanType:",FlowData.CleanType,stmt,", CleanGeo/BakeTex:",mytool.CleanGeo,"/",mytool.BakeTex,", Clean/BakeTimes:",FlowData.CleanTimes,"/",FlowData.BakeTimes,")")
 
-                print("  Cleaning (","Initial:",FlowData.VertexCountInitialX,", Final:",FlowData.VertexCountFinalX,", Reduction:",round(100-(FlowData.VertexCountFinalX*100/FlowData.VertexCountInitialX),1),"%",")")
+                print("  Cleaning (","Initial:",FlowData.VertexCountInitialX,", Final:",FlowData.VertexCountFinalX,", Reduction:",round(100-(FlowData.VertexCountFinalX*100/max(1, FlowData.VertexCountInitialX)),1),"%",")")
 
                 if FlowData.ModelType == "Voxel":
                     print("  Geometry (","SmallestEdge:",FlowData.SmallestEdgeLength,", LargestEdge:",FlowData.LargestEdgeLength,", BlocksInLargestEdge:",FlowData.LargestEdgeBlocks,")")
@@ -2336,29 +1906,14 @@ class VoxMethods():
         return list(set(NodeList))
 
     def TextureExport(context):
-
-        scene = context.scene
-        mytool = scene.vox_tool
-
-        NodeList = VoxMethods.GetTextures(context)
-        
-
-        for Node in NodeList:
-            try:
-                #TargetNode = bpy.context.active_object.active_material.node_tree.nodes[MapKey]
-                ObjectTexture = Node.image
-                ObjectTexture.alpha_mode = 'STRAIGHT'
-                FilePath = os.path.join(mytool.ExportLocation, str(ObjectTexture.name)+".png")
-                ObjectTexture.file_format='PNG'
-                AreaType = bpy.context.area.type
-                bpy.context.area.type = 'IMAGE_EDITOR'
-                bpy.context.area.spaces.active.image = ObjectTexture 
-                bpy.ops.image.save_as(save_as_render=False, copy=False, filepath=FilePath,show_multiview=False, use_multiview=False)
-                bpy.context.area.type = AreaType
-            except error as e:
-                print("Texture Export Error",e)
-        
-        return len(NodeList)
+        folder = os.path.realpath(bpy.path.abspath(context.scene.vox_tool.ExportLocation))
+        images = sorted({node.image for node in VoxMethods.GetTextures(context)}, key=lambda image: image.name)
+        names = batch.safe_names(image.name for image in images)
+        for image in images:
+            image.file_format = 'PNG'
+            image.filepath_raw = os.path.join(folder, names[image.name] + '.png')
+            image.save()
+        return len(images)
 
 class ApplyVColors(bpy.types.Operator):
     """Apply the mesh's vertex colors as the base color.
@@ -2397,7 +1952,7 @@ This button is context sensitive & will only appear if you have a .PLY mesh sele
             return {'CANCELLED'}
 
 
-class LazyClean(bpy.types.Operator):
+class LazyClean(batch.BatchOperator, bpy.types.Operator):
     """Lazy Clean selected models"""
     bl_idname = "voxcleaner.lazyclean"
     bl_label = "Easy Clean"
@@ -2415,7 +1970,13 @@ class LazyClean(bpy.types.Operator):
             return {'CANCELLED'}
 
 
-        if CleanStatus > 1 & mytool.CommonUV == True:
+        if CleanStatus > 1 and not mytool.CommonUV:
+            return self.start_batch(context, 'clean')
+        if any(not obj.data.polygons for obj in context.selected_objects):
+            self.report({'WARNING'}, 'Selected mesh has no faces')
+            return {'CANCELLED'}
+
+        if CleanStatus > 1 and mytool.CommonUV:
             
             #Check for a mixed model set
             ModelType = VoxMethods.MrModelTypeChecker(context.selected_objects)
@@ -2462,7 +2023,7 @@ class LazyClean(bpy.types.Operator):
             VoxMethods.ApplySplitToBothObjects(context)
 
             #Give out a feedback
-            PercentageCleaning = round(100-(FlowData.VertexCountFinalX*100/FlowData.VertexCountInitialX),1)
+            PercentageCleaning = round(100-(FlowData.VertexCountFinalX*100/max(1, FlowData.VertexCountInitialX)),1)
             if FlowData.ModelType == "Voxel": stmnt = "Model Set cleaned! "+str(PercentageCleaning)+"% avg vertex reduction!"
             else: stmnt = str(FlowData.ModelType)+" Model Set cleaned! "+str(PercentageCleaning)+"% avg vertex reduction!"
             self.report({'INFO'}, stmnt)
@@ -2490,6 +2051,8 @@ class LazyClean(bpy.types.Operator):
                 #select ith obj
                 bpy.context.view_layer.objects.active = ObjArray[0]
                 ObjArray[0].select_set(True)
+                if ObjArray[0].data.users > 1:
+                    ObjArray[0].data = ObjArray[0].data.copy()
                 FlowData.ModelType = VoxMethods.MrModelTypeChecker(context.selected_objects)
                 
                 # clean Selected Object
@@ -2519,8 +2082,9 @@ class LazyClean(bpy.types.Operator):
                 #Get a vert count dammit
                 FlowData.VertexCountFinalX = len(FlowData.MainObj.data.vertices)
 
-                CleanPercentageArray.append(round(100-(FlowData.VertexCountFinalX*100/FlowData.VertexCountInitialX),1))
+                CleanPercentageArray.append(round(100-(FlowData.VertexCountFinalX*100/max(1, FlowData.VertexCountInitialX)),1))
 
+                FlowData.CommonUVDupeObjects = [FlowData.DupeObj]
                 VoxMethods.EndProcess(context)
 
             # select the object
@@ -2622,7 +2186,7 @@ class PrepareForBake(bpy.types.Operator):
 
             FlowData.CleanTimes = FlowData.CleanTimes+1
             # Give out a feedback
-            stmnt = "Ready For Shared Texture Bake! "+str(round(100-(FlowData.VertexCountFinalX*100/FlowData.VertexCountInitialX),1))+"% vertex reduction!"
+            stmnt = "Ready For Shared Texture Bake! "+str(round(100-(FlowData.VertexCountFinalX*100/max(1, FlowData.VertexCountInitialX)),1))+"% vertex reduction!"
             self.report({'INFO'}, stmnt)
             return {'FINISHED'}
 
@@ -2654,7 +2218,7 @@ class PrepareForBake(bpy.types.Operator):
 
             FlowData.CleanTimes = FlowData.CleanTimes+1
             # Give out a feedback
-            stmnt = "Ready For Texture Bake! "+str(round(100-(FlowData.VertexCountFinalX*100/FlowData.VertexCountInitialX),1))+"% vertex reduction!"
+            stmnt = "Ready For Texture Bake! "+str(round(100-(FlowData.VertexCountFinalX*100/max(1, FlowData.VertexCountInitialX)),1))+"% vertex reduction!"
             self.report({'INFO'}, stmnt)
             return {'FINISHED'}
 
@@ -2759,182 +2323,70 @@ class OpenExportFolder(bpy.types.Operator):
         return {'FINISHED'}
     
 
-class ExportOBJ(bpy.types.Operator):
-    """Export OBJ files of the selected meshes, with textures"""
+def export_one(context, obj, format, filename):
+    folder = os.path.realpath(bpy.path.abspath(context.scene.vox_tool.ExportLocation))
+    path = os.path.join(folder, filename + '.' + format)
+    selected = list(context.selected_objects)
+    active = context.view_layer.objects.active
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        if format == 'obj':
+            result = bpy.ops.wm.obj_export(filepath=path, export_selected_objects=True,
+                forward_axis='NEGATIVE_Z', up_axis='Y', export_animation=False,
+                apply_modifiers=True, export_materials=True,
+                export_triangulated_mesh=context.scene.vox_tool.TriangulatedExport,
+                path_mode='AUTO')
+        else:
+            result = bpy.ops.export_scene.fbx(filepath=path, use_selection=True,
+                apply_scale_options='FBX_SCALE_ALL', bake_anim=False,
+                use_triangles=context.scene.vox_tool.TriangulatedExport, path_mode='AUTO')
+        if result != {'FINISHED'} or not os.path.isfile(path) or not os.path.getsize(path):
+            raise RuntimeError(f'Export failed: {path}')
+    finally:
+        bpy.ops.object.select_all(action='DESELECT')
+        for item in selected:
+            item.select_set(True)
+        context.view_layer.objects.active = active
+
+
+class ExportMeshes(batch.BatchOperator):
+    def execute(self, context):
+        status = VoxMethods.MrChecker(context)[2]
+        if not isinstance(status, int):
+            self.report({'WARNING'}, status)
+            return {'CANCELLED'}
+        folder = context.scene.vox_tool.ExportLocation
+        if not folder or not os.path.isdir(bpy.path.abspath(folder)):
+            self.report({'WARNING'}, 'Choose an existing export folder')
+            return {'CANCELLED'}
+        if status > 1:
+            return self.start_batch(context, self.export_format)
+        try:
+            count = VoxMethods.TextureExport(context)
+            obj = context.selected_objects[0]
+            export_one(context, obj, self.export_format, batch.safe_names([obj.name])[obj.name])
+        except Exception as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'1 {self.export_format.upper()} and {count} textures exported')
+        return {'FINISHED'}
+
+
+class ExportOBJ(ExportMeshes, bpy.types.Operator):
+    """Export one OBJ per selected mesh, with textures"""
     bl_idname = "voxcleaner.exportobj"
     bl_label = "Export OBJ"
-    bl_options = {'UNDO'}
-    
-    def execute(self, context):
-        
-        scene = context.scene
-        mytool = scene.vox_tool
-        
-        #Directory checks
-        if len(mytool.ExportLocation) <= 0:
-            self.report({'WARNING'}, 'Please add an export location')
-            return {'CANCELLED'}
+    export_format = 'obj'
 
-        ExportDirectory = os.path.realpath(bpy.path.abspath(mytool.ExportLocation))
 
-        if not os.path.exists(ExportDirectory):
-            #mytool.ExportLocation = ""
-            self.report({'WARNING'}, 'Export Location does not exist, please add another location')
-            return {'CANCELLED'}
-
-        #Mr Checker Checks
-        CleanStatus,StepStatus,ExportStatus = VoxMethods.MrChecker(context)
-        
-        if type(ExportStatus) == int:
-            ExportObjArray = bpy.context.selected_objects
-
-            #export all Obj textures
-            t=0
-            try:
-                TextueresExportedForThisObject = VoxMethods.TextureExport(context)
-                t+=TextueresExportedForThisObject
-            except Exception as e:
-                print(e)
-                pass
-        
-            #deselect everything
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.context.view_layer.objects.active = None
-            
-            #select ith obj
-            bpy.context.view_layer.objects.active = ExportObjArray[0]
-            ExportObjArray[0].select_set(True)
-
-            #Generate file names
-            FileNameOBJ=ExportObjArray[0].name+'.obj'
-            #ImageFileName=ExportObjArray[i].name+'.png'
-
-            
-            
-            #export Obj
-            TargetFile = os.path.join(ExportDirectory, FileNameOBJ)
-            bpy.ops.wm.obj_export(filepath=TargetFile, 
-                                    check_existing=True, 
-                                    forward_axis='NEGATIVE_Z', up_axis ='Y', 
-                                    filter_glob="*.obj;*.mtl", 
-                                    export_selected_objects =True, 
-                                    export_animation=False, 
-                                    apply_modifiers=True, 
-                                    #use_edges=True, 
-                                    #keep_smooth_curves=False, 
-                                    #use_smooth_groups_bitflags=False,
-                                    export_normals=True, 
-                                    #use_uvs=True, 
-                                    export_materials=True, 
-                                    export_triangulated_mesh=mytool.TriangulatedExport, 
-                                    export_vertex_groups=False, 
-                                    #use_blen_objects=True, 
-                                    export_object_groups=False, 
-                                    #keep_vertex_order=False, 
-                                    global_scale=1, 
-                                    path_mode='AUTO')
-                
-            
-            for obj in ExportObjArray:
-                obj.select_set(True)
-
-            MeshText = str(len(ExportObjArray)) + str(" OBJs" if len(ExportObjArray) > 1 else " OBJ")
-            TextureText = str(int(t)) + str(" textures" if int(t) > 1 else " texture")
-
-            stmt = MeshText+" with "+TextureText+" exported!"
-
-            self.report({'INFO'}, stmt)
-            return {'FINISHED'}
-        else:
-            self.report({'WARNING'}, ExportStatus)
-            return {'CANCELLED'}
-
-class ExportFBX(bpy.types.Operator):
-    """Export FBX files of the selected meshes, with textures"""
+class ExportFBX(ExportMeshes, bpy.types.Operator):
+    """Export one FBX per selected mesh, with textures"""
     bl_idname = "voxcleaner.exportfbx"
     bl_label = "Export FBX"
-    bl_options = {'UNDO'}
-    
-    def execute(self, context):
-        
-        scene = context.scene
-        mytool = scene.vox_tool
-        
-        #Directory checks
-        if len(mytool.ExportLocation) <= 0:
-            self.report({'WARNING'}, 'Please add an export location')
-            return {'CANCELLED'}
+    export_format = 'fbx'
 
-        ExportDirectory = os.path.realpath(bpy.path.abspath(mytool.ExportLocation))
-
-        if not os.path.exists(ExportDirectory):
-            #mytool.ExportLocation = ""
-            self.report({'WARNING'}, 'Export Location does not exist, please add another location')
-            return {'CANCELLED'}
-
-        #Mr Checker Checks
-        CleanStatus,StepStatus, ExportStatus = VoxMethods.MrChecker(context)
-
-
-        
-        
-        if type(ExportStatus) == int:
-            ExportFbxArray = bpy.context.selected_objects
-
-            #export fbx texture
-            t = 0
-            try:
-                TextueresExportedForThisObject = VoxMethods.TextureExport(context)
-                t+=TextueresExportedForThisObject
-            except Exception as e:
-                pass
-            
-            i = 0
-            while i < len(ExportFbxArray):
-                #deselect everything
-                bpy.ops.object.select_all(action='DESELECT')
-                bpy.context.view_layer.objects.active = None
-                
-                #select ith obj
-                bpy.context.view_layer.objects.active = ExportFbxArray[i]
-                ExportFbxArray[i].select_set(True)
-
-                #Generate file names
-                FileNameOBJ=ExportFbxArray[i].name+'.fbx'
-                #ImageFileName=ExportFbxArray[i].name+'.png'
-
-                
-                #Export FBX
-                if mytool.TriangulatedExport:
-                    #Dupe n do that triangulation
-                    bpy.ops.object.duplicate()
-                    TriaDommi = bpy.context.active_object
-                    VoxMethods.TriangulateModel(context)
-                    TargetFile = os.path.join(ExportDirectory, FileNameOBJ)
-                    bpy.ops.export_scene.fbx(filepath=str(TargetFile), use_selection=True, apply_scale_options = 'FBX_SCALE_ALL')
-                    TriaDommi.select_set(True)
-                    bpy.context.view_layer.objects.active = TriaDommi
-                    bpy.ops.object.delete(use_global=False)
-                else:
-                    TargetFile = os.path.join(ExportDirectory, FileNameOBJ)
-                    bpy.ops.export_scene.fbx(filepath=str(TargetFile), use_selection=True, apply_scale_options = 'FBX_SCALE_ALL')
-
-                i = i+1
-            
-            for obj in ExportFbxArray:
-                obj.select_set(True)
-
-            MeshText = str(len(ExportFbxArray)) + str(" FBXs" if len(ExportFbxArray) > 1 else " FBX")
-            TextureText = str(int(t)) + str(" textures" if int(t) > 1 else " texture")
-
-            stmt = MeshText+" with "+TextureText+" exported!"
-
-            self.report({'INFO'}, stmt)
-            return {'FINISHED'}
-        else:
-            self.report({'WARNING'}, ExportStatus)
-            return {'CANCELLED'}
-    
 class ResetSettings(bpy.types.Operator):
     """Reset all settings in this add-on"""
     bl_idname = "voxcleaner.resetsettings"
@@ -2944,6 +2396,7 @@ class ResetSettings(bpy.types.Operator):
     def execute(self, context):
 
         mytool = context.scene.vox_tool
+        mytool.BatchWorkers = 0
         mytool.BaseColor = StaticData.BaseColorDefault
         mytool.AlphaBool = StaticData.AlphaDefault
         mytool.ResolutionSet = StaticData.ResolutionDefault
@@ -2962,10 +2415,9 @@ class ResetSettings(bpy.types.Operator):
         return {'FINISHED'} 
     
 class CheckForUpdates(bpy.types.Operator):
-    """Check for add-on updates on Vox Cleaner's Official Gumroad page!
-All V3.x updates are FREE!"""
+    """Open the upstream Vox Cleaner page; see the fork README for this build"""
     bl_idname = "voxcleaner.checkforupdates"
-    bl_label = "Check For Updates!  (v3.0 current)"
+    bl_label = "Upstream Updates"
 
     def execute(self, context):
 
@@ -3071,6 +2523,8 @@ class VoxClean(bpy.types.Panel):
                 else:
                     if mytool.CommonUV == True:
                         row.operator("voxcleaner.lazyclean",icon = 'COLOR',text = 'Clean with Shared UVs')
+                    else:
+                        row.operator("voxcleaner.lazyclean", icon='SOLO_ON', text=f'Clean {CleanStatus} Models')
             else:
                 row.label(icon="ERROR", text = CleanStatus)
 
@@ -3292,6 +2746,7 @@ class VoxSettings(bpy.types.Panel):
         
         # Model Settings Panel
         col = layout.column()
+        col.prop(mytool, "BatchWorkers")
         col.label(text = "Model Settings",icon = 'OBJECT_DATA')
         
         box = col.box()
@@ -3416,6 +2871,7 @@ def menu_func_import(self, context):
 
 
 def register():
+    batch.register()
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -3423,9 +2879,10 @@ def register():
 
         
 def unregister():
+    batch.unregister()
     del bpy.types.Scene.vox_tool
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    for cls in classes:
+    for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     
     
