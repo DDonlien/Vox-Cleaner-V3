@@ -28,7 +28,7 @@ Build the installable extension with Python 3.9+:
 python3 scripts/package_addon.py
 ```
 
-In Blender, open **Preferences → Add-ons → Install from Disk** and choose `dist/vox-cleaner-3.3.0.zip`. The original `Vox_Cleaner_V3.1.zip` and `Vox_Cleaner_V3.2.zip` archives in this repository are unchanged upstream releases, not this build.
+In Blender, open **Preferences → Add-ons → Install from Disk** and choose the newly built `dist/vox-cleaner-3.3.0.zip` or the saved `release/voxel-cleaner-3.3.0.zip`. The original `release/Vox_Cleaner_V3.1.zip` and `release/Vox_Cleaner_V3.2.zip` archives are unchanged upstream releases, not this build.
 
 Tests:
 
